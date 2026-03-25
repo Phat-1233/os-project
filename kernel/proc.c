@@ -133,6 +133,7 @@ found:
   }
 
   // An empty user page table.
+  p->tracemask = 0;
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
     freeproc(p);
@@ -295,6 +296,9 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+  
+  // copy trace mask from parent to child
+  np->tracemask = p->tracemask;
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
