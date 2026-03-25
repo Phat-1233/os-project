@@ -100,3 +100,49 @@ sys_trace(void)
   myproc()->tracemask = mask;
   return 0;
 }
+
+extern struct proc proc[];
+uint64
+sys_procinfo(void)
+{
+  int pid;
+  uint64 addr;
+
+  argint(0, &pid);
+  argaddr(1, &addr);
+
+  struct proc *p;
+  struct procinfo info;
+  int found = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid){
+      found = 1;
+      info.pid = p->pid;
+      info.state = p->state;
+      info.sz = p->sz;
+      strncpy(info.name, p->name, 16);
+
+      if(p->parent){
+        acquire(&p->parent->lock);
+        info.ppid = p->parent->pid;
+        release(&p->parent->lock);
+      } else {
+        info.ppid = 0;
+      }
+
+      release(&p->lock);
+      break;
+    }
+    release(&p->lock);
+  }
+
+  if(!found)
+    return -1;
+
+  if(copyout(myproc()->pagetable, addr, (char *)&info, sizeof(info)) < 0)
+    return -1;
+
+  return 0;
+}

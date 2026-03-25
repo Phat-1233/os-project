@@ -1,4 +1,5 @@
 struct stat;
+struct procinfo;
 
 // system calls
 int fork(void);
@@ -42,3 +43,4 @@ void *memcpy(void *, const void *, uint);
 void* malloc(uint);
 void free(void*);
 int trace(int);
+int procinfo(int, struct procinfo*);
