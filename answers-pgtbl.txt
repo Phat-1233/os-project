@@ -1,0 +1,53 @@
+1. What does a page table entry (PTE) contain?
+A page table entry (PTE) contains:
+The physical page number (PPN) that the virtual page maps to.
+A set of flags that describe permissions and status:
+PTE_V: valid
+PTE_R: readable
+PTE_W: writable
+PTE_X: executable
+PTE_U: user-accessible
+
+2. When is a PTE considered a leaf?
+A PTE is considered a leaf if any of the permission bits (PTE_R, PTE_W, or PTE_X) are set.
+If none of these bits are set, the PTE instead points to a lower-level page table.
+
+3. How many levels are there in xv6 page tables?
+xv6 uses a three-level page table:
+    Level 2 (top level)
+    Level 1
+    Level 0 (leaf level)
+    Each level indexes 9 bits of the virtual address.
+
+4. Why are there multiple levels of page tables?
+Multiple levels are used to:
+Reduce memory usage (allocate page tables only when needed)
+Avoid allocating a full flat page table for the entire virtual address space
+
+5. What is the purpose of the vmprint function?
+The vmprint function:
+Recursively prints the structure of the page table
+Helps visualize how virtual addresses map to physical memory
+Useful for debugging page table setup
+
+6. Why does the kernel not set the PTE_U bit for its mappings?
+The kernel does not set PTE_U because:
+    Kernel memory must not be accessible from user mode
+    This ensures protection and isolation between user processes and the kernel
+
+7. What happens if PTE_V is not set?
+If PTE_V is not set:
+    The entry is invalid
+    Any access to that virtual address will cause a page fault
+
+8. Why does xv6 use virtual memory?
+xv6 uses virtual memory to:
+    Provide isolation between processes
+    Allow each process to have its own address space
+    Simplify memory management
+
+9. Explanation of vmprint output
+Each line shows:
+    The index in the page table
+    The PTE value
+    The corresponding physical address

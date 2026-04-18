@@ -128,7 +128,13 @@ exec(char *path, char **argv)
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
-  return argc; // this ends up in a0, the first argument to main(argc, argv)
+  static int printed = 0;
+  if(p->pid == 1 && printed == 0){
+    vmprint(p->pagetable);
+    printed = 1;
+  }
+
+  return argc;
 
  bad:
   if(pagetable)

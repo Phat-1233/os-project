@@ -80,3 +80,58 @@ kalloc(void)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
 }
+
+// Allocate a 2MB contiguous and aligned superpage
+void *
+kalloc_super(void)
+{
+  struct run *r, *prev;
+  struct run *block_start_prev = 0; // Khởi tạo = 0 để fix warning
+  struct run *target = 0;
+  int count = 0;
+  uint64 expected_next = 0;
+
+  acquire(&kmem.lock);
+
+  prev = 0;
+  r = kmem.freelist;
+  while(r){
+    if(count == 0){
+      uint64 base = (uint64)r - 511 * PGSIZE;
+      // Khối bộ nhớ phải được align đúng 2MB
+      if (base % (1<<21) == 0) {
+        block_start_prev = prev;
+        count = 1;
+        expected_next = (uint64)r - PGSIZE;
+      }
+    } else {
+      if ((uint64)r == expected_next) {
+        count++;
+        expected_next -= PGSIZE;
+        if (count == 512) {
+          target = r; // Tìm thấy khối 512 trang liên tiếp
+          break;
+        }
+      } else {
+        count = 0;
+        continue; // Bắt đầu tìm lại từ r hiện tại
+      }
+    }
+    prev = r;
+    r = r->next;
+  }
+
+  if(count == 512 && target){
+    if(block_start_prev)
+      block_start_prev->next = target->next;
+    else
+      kmem.freelist = target->next;
+      
+    release(&kmem.lock);
+    memset((char*)target, 5, 512 * PGSIZE);
+    return (void*)target;
+  }
+  
+  release(&kmem.lock);
+  return 0;
+}

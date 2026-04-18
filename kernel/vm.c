@@ -8,6 +8,8 @@
 #include "proc.h"
 #include "fs.h"
 
+void* kalloc_super(void);
+
 /*
  * the kernel's page table.
  */
@@ -100,20 +102,30 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
 
   for(int level = 2; level > 0; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
+
     if(*pte & PTE_V) {
-      pagetable = (pagetable_t)PTE2PA(*pte);
-#ifdef LAB_PGTBL
-      if(PTE_LEAF(*pte)) {
-        return pte;
+
+      // 🔥 nếu là leaf (superpage hoặc page thường)
+      if(*pte & (PTE_R | PTE_W | PTE_X)) {
+        return pte;  // STOP luôn
       }
-#endif
+
+      pagetable = (pagetable_t)PTE2PA(*pte);
+
     } else {
-      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+      if(!alloc)
         return 0;
-      memset(pagetable, 0, PGSIZE);
-      *pte = PA2PTE(pagetable) | PTE_V;
+
+      pagetable_t new = (pagetable_t)kalloc();
+      if(new == 0)
+        return 0;
+
+      memset(new, 0, PGSIZE);
+      *pte = PA2PTE(new) | PTE_V;
+      pagetable = new;
     }
   }
+
   return &pagetable[PX(0, va)];
 }
 
@@ -130,13 +142,21 @@ walkaddr(pagetable_t pagetable, uint64 va)
     return 0;
 
   pte = walk(pagetable, va, 0);
-  if(pte == 0)
+  if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
     return 0;
-  if((*pte & PTE_V) == 0)
-    return 0;
-  if((*pte & PTE_U) == 0)
-    return 0;
+  
   pa = PTE2PA(*pte);
+
+  // Nếu đây là superpage, tính offset bên trong vùng 2MB
+  pte_t *pte2 = &pagetable[PX(2, va)];
+  if(*pte2 & PTE_V){
+    pagetable_t l1 = (pagetable_t)PTE2PA(*pte2);
+    pte_t *pte1 = &l1[PX(1, va)];
+    if((*pte1 & PTE_V) && (*pte1 & (PTE_R|PTE_W|PTE_X))){
+      pa += (va & ((1<<21) - 1));
+    }
+  }
+
   return pa;
 }
 
@@ -159,31 +179,59 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 int
 mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 {
-  uint64 a, last;
-  pte_t *pte;
+  uint64 a;
 
   if((va % PGSIZE) != 0)
     panic("mappages: va not aligned");
 
-  if((size % PGSIZE) != 0)
-    panic("mappages: size not aligned");
-
   if(size == 0)
     panic("mappages: size");
-  
-  a = va;
-  last = va + size - PGSIZE;
-  for(;;){
-    if((pte = walk(pagetable, a, 1)) == 0)
-      return -1;
-    if(*pte & PTE_V)
-      panic("mappages: remap");
-    *pte = PA2PTE(pa) | perm | PTE_V;
-    if(a == last)
-      break;
-    a += PGSIZE;
-    pa += PGSIZE;
+
+  for(a = va; a < va + size; ){
+    
+    // 🔥 nếu map superpage 2MB
+    if(size >= (1 << 21) &&
+       (a % (1 << 21) == 0) &&
+       (pa % (1 << 21) == 0)) {
+
+      // đi tới level 1
+      pte_t *pte = &pagetable[PX(2, a)];
+
+      if(!(*pte & PTE_V)){
+        pagetable_t newtbl = (pagetable_t)kalloc();
+        if(newtbl == 0)
+          return -1;
+        memset(newtbl, 0, PGSIZE);
+        *pte = PA2PTE(newtbl) | PTE_V;
+      }
+
+      pagetable_t l1 = (pagetable_t)PTE2PA(*pte);
+      pte = &l1[PX(1, a)];
+
+      if(*pte & PTE_V)
+        panic("mappages: remap superpage");
+
+      *pte = PA2PTE(pa) | perm | PTE_V;
+
+      a += (1 << 21);
+      pa += (1 << 21);
+    }
+    else {
+      // bình thường 4KB
+      pte_t *pte = walk(pagetable, a, 1);
+      if(pte == 0)
+        return -1;
+
+      if(*pte & PTE_V)
+        panic("mappages: remap");
+
+      *pte = PA2PTE(pa) | perm | PTE_V;
+
+      a += PGSIZE;
+      pa += PGSIZE;
+    }
   }
+
   return 0;
 }
 
@@ -195,26 +243,66 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
   uint64 a;
   pte_t *pte;
-  int sz;
 
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
 
-  for(a = va; a < va + npages*PGSIZE; a += sz){
-    sz = PGSIZE;
-    if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0) {
-      printf("va=%ld pte=%ld\n", a, *pte);
-      panic("uvmunmap: not mapped");
+  for(a = va; a < va + npages*PGSIZE; ){
+    pte_t *pte2 = &pagetable[PX(2, a)];
+    if((*pte2 & PTE_V) == 0) panic("uvmunmap: not mapped");
+    
+    pagetable_t l1 = (pagetable_t)PTE2PA(*pte2);
+    pte_t *pte1 = &l1[PX(1, a)];
+    if((*pte1 & PTE_V) == 0) panic("uvmunmap: not mapped");
+    
+    if(*pte1 & (PTE_R | PTE_W | PTE_X)){
+      // Phát hiện Superpage 2MB
+      uint64 super_start = a & ~((1<<21)-1);
+      uint64 super_end = super_start + (1<<21);
+      uint64 unmap_end = va + npages*PGSIZE;
+      
+      // 🔥 KIỂM TRA SPLIT: Nếu chỉ xoá một phần của 2MB (partial unmap do sbrk âm)
+      if(a > super_start || unmap_end < super_end) {
+        pagetable_t new_l0 = (pagetable_t)kalloc();
+        if(new_l0 == 0) panic("uvmunmap: kalloc for split failed");
+        memset(new_l0, 0, PGSIZE);
+        
+        uint64 base_pa = PTE2PA(*pte1);
+        uint64 flags = PTE_FLAGS(*pte1);
+        
+        // Tách 1 Superpage thành 512 trang 4KB
+        for(int i = 0; i < 512; i++){
+          new_l0[i] = PA2PTE(base_pa + i * PGSIZE) | flags;
+        }
+        *pte1 = PA2PTE(new_l0) | PTE_V; // Biến node lá level 1 thành node trung gian
+        
+        // Bỏ qua bước a += 2MB, lặp lại để unmap trang 4KB ở level 0 vừa tạo
+        continue;
+      }
+
+      // NẾU xoá trọn vẹn 2MB
+      if(do_free){
+        uint64 pa = PTE2PA(*pte1);
+        for(int i = 0; i < 512; i++) {
+          kfree((void*)(pa + i * PGSIZE));
+        }
+      }
+      *pte1 = 0;
+      a += (1 << 21);
+    } else {
+      // Unmap trang 4KB bình thường
+      pagetable_t l0 = (pagetable_t)PTE2PA(*pte1);
+      pte = &l0[PX(0, a)];
+      if((*pte & PTE_V) == 0) panic("uvmunmap: not mapped");
+      if((PTE_FLAGS(*pte) & (PTE_R | PTE_W | PTE_X)) == 0) panic("uvmunmap: not a leaf");
+      
+      if(do_free){
+        uint64 pa = PTE2PA(*pte);
+        kfree((void*)pa);
+      }
+      *pte = 0;
+      a += PGSIZE;
     }
-    if(PTE_FLAGS(*pte) == PTE_V)
-      panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
-    }
-    *pte = 0;
   }
 }
 
@@ -261,7 +349,24 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
     return oldsz;
 
   oldsz = PGROUNDUP(oldsz);
-  for(a = oldsz; a < newsz; a += sz){
+  for(a = oldsz; a < newsz; ){
+    // Nếu thoả mãn điều kiện cấp 2MB (đủ kích thước và địa chỉ bắt đầu align 2MB)
+    if ((a % (1<<21) == 0) && (newsz - a >= (1<<21))) {
+      mem = kalloc_super();
+      if(mem != 0) {
+#ifndef LAB_SYSCALL
+        memset(mem, 0, (1<<21));
+#endif
+        if(mappages(pagetable, a, (1<<21), (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+          for(int i=0; i<512; i++) kfree(mem + i*PGSIZE);
+          uvmdealloc(pagetable, a, oldsz);
+          return 0;
+        }
+        a += (1<<21);
+        continue;
+      }
+    }
+
     sz = PGSIZE;
     mem = kalloc();
     if(mem == 0){
@@ -276,6 +381,7 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
       uvmdealloc(pagetable, a, oldsz);
       return 0;
     }
+    a += sz;
   }
   return newsz;
 }
@@ -341,28 +447,58 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uint64 pa, i;
   uint flags;
   char *mem;
-  int szinc;
 
-  for(i = 0; i < sz; i += szinc){
-    szinc = PGSIZE;
-    szinc = PGSIZE;
-    if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
-    if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+  for(i = 0; i < sz; ){
+    pte_t *pte2 = &old[PX(2, i)];
+    if(*pte2 & PTE_V){
+      pagetable_t l1 = (pagetable_t)PTE2PA(*pte2);
+      pte_t *pte1 = &l1[PX(1, i)];
+      
+      if((*pte1 & PTE_V) && (*pte1 & (PTE_R|PTE_W|PTE_X))){
+        pa = PTE2PA(*pte1);
+        flags = PTE_FLAGS(*pte1);
+        
+        if((mem = kalloc_super()) != 0){
+          // Cấp phát 2MB thành công
+          memmove(mem, (char*)pa, 1 << 21);
+          if(mappages(new, i, (1 << 21), (uint64)mem, flags) != 0){
+            for(int j=0; j<512; j++) kfree(mem + j*PGSIZE);
+            goto err;
+          }
+        } else {
+          // 🔥 FALLBACK: Ram phân mảnh không cấp được 2MB -> Tự động rã thành 512 trang 4KB cho tiến trình con
+          for(int j = 0; j < 512; j++){
+            if((mem = kalloc()) == 0) goto err;
+            memmove(mem, (char*)(pa + j*PGSIZE), PGSIZE);
+            if(mappages(new, i + j*PGSIZE, PGSIZE, (uint64)mem, flags) != 0){
+              kfree(mem);
+              goto err;
+            }
+          }
+        }
+        i += (1 << 21);
+        continue;
+      }
+    }
+
+    if((pte = walk(old, i, 0)) == 0) panic("uvmcopy: pte should exist");
+    if((*pte & PTE_V) == 0) panic("uvmcopy: page not present");
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
       goto err;
+
     memmove(mem, (char*)pa, PGSIZE);
     if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
       kfree(mem);
       goto err;
     }
+    i += PGSIZE;
   }
   return 0;
 
- err:
+err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
@@ -488,9 +624,40 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 
 
 #ifdef LAB_PGTBL
-void
-vmprint(pagetable_t pagetable) {
-  // your code here
+// Hàm đệ quy phụ trợ
+void vmprintwalk(pagetable_t pagetable, int depth, uint64 va)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+
+    if(pte & PTE_V){
+      uint64 pa = PTE2PA(pte);
+
+      // 🔥 FIX CHUẨN
+      uint64 shift = 12 + 9 * (3 - depth);
+      uint64 newva = va | ((uint64)i << shift);
+
+      for(int j = 0; j < depth; j++)
+        printf(" ..");
+
+      printf("%p: pte %p pa %p\n",
+             (void*)newva,
+             (void*)pte,
+             (void*)pa);
+
+      if((pte & (PTE_R | PTE_W | PTE_X)) == 0){
+        vmprintwalk((pagetable_t)pa, depth + 1, newva);
+      }
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n", pagetable);
+
+  // bắt đầu từ depth = 1 (giống output mẫu)
+  vmprintwalk(pagetable, 1, 0);
 }
 #endif
 
